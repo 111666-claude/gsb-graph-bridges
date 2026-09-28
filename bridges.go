@@ -3,6 +3,8 @@ package graphbridges
 
 import (
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -22,104 +24,156 @@ type Result struct {
 	Components   int
 }
 
-// ParseEdges 解析 "a-b,b-c"。缺陷：不校验顶点名，报错也不给边的下标。
+// ParseEdges 解析 "a-b,b-c"。缺 "-" 或顶点名为空时报错并指出是第几条边（从 1 数起）。
 func ParseEdges(text string) ([]Edge, error) {
 	edges := []Edge{}
-	for _, item := range strings.Split(text, ",") {
+	for i, item := range strings.Split(text, ",") {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
 		}
 		left, right, found := strings.Cut(item, "-")
 		if !found {
-			return nil, ErrFormat
+			return nil, fmt.Errorf("%w：第 %d 条边 %q 缺少 \"-\"", ErrFormat, i+1, item)
+		}
+		left = strings.TrimSpace(left)
+		right = strings.TrimSpace(right)
+		if left == "" || right == "" {
+			return nil, fmt.Errorf("%w：第 %d 条边 %q 顶点名不能为空", ErrFormat, i+1, item)
 		}
 		edges = append(edges, Edge{A: left, B: right})
 	}
 	return edges, nil
 }
 
-type solver struct {
-	adj          map[string][]string
-	nodes        []string
-	disc         map[string]int
-	low          map[string]int
-	bridges      []Edge
-	articulation map[string]bool
-	clock        int
-}
-
-// dfs 缺陷：把「回到父节点的边」一律跳过，平行边因此被当成一条；
-// 割点判定又用了 low[child] > disc[u]，少了等号。
-func (s *solver) dfs(node, parent string) {
-	s.clock++
-	s.disc[node] = s.clock
-	s.low[node] = s.clock
-	children := 0
-	for _, next := range s.adj[node] {
-		if next == parent {
-			continue
-		}
-		if reached, ok := s.disc[next]; ok {
-			if reached < s.low[node] {
-				s.low[node] = reached
-			}
-			continue
-		}
-		children++
-		s.dfs(next, node)
-		if s.low[next] < s.low[node] {
-			s.low[node] = s.low[next]
-		}
-		if s.low[next] > s.disc[node] {
-			s.bridges = append(s.bridges, Edge{A: node, B: next})
-		}
-		if parent != "" && s.low[next] > s.disc[node] {
-			s.articulation[node] = true
-		}
-	}
-	if parent == "" && children > 1 {
-		s.articulation[node] = true
-	}
+// half 是邻接表里的一条半边，edge 是输入边的编号。
+type half struct {
+	to   int
+	edge int
 }
 
 // Solve 求桥、割点与连通分量数。
+//
+// 口径：
+//   - 平行边不是桥：DFS 按边编号记父边，同一对顶点之间的第二条边算回边。
+//   - 割点：非根节点用 low[child] >= disc[u]，根节点用「子节点数 > 1」。
+//   - 自环忽略：不算桥、不产生割点，顶点本身保留。
+//   - 桥与割点按字典序输出，桥的两个端点按字典序写。
+//
+// 用迭代式 DFS，深链不会爆栈；顶点先映射成整数编号，邻接表用切片，
+// 时间 O(V+E)，内存 O(V+E)。
 func Solve(edges []Edge) Result {
-	s := &solver{
-		adj:          map[string][]string{},
-		disc:         map[string]int{},
-		low:          map[string]int{},
-		articulation: map[string]bool{},
+	ids := map[string]int{}
+	names := []string{}
+	adj := [][]half{}
+	edgeCount := 0
+	getID := func(name string) int {
+		if id, ok := ids[name]; ok {
+			return id
+		}
+		id := len(names)
+		ids[name] = id
+		names = append(names, name)
+		adj = append(adj, nil)
+		return id
 	}
 	for _, edge := range edges {
-		if edge.A == edge.B {
-			if _, ok := s.disc[edge.A]; !ok {
-				s.disc[edge.A] = 0
-			}
-			continue
+		a := getID(edge.A)
+		b := getID(edge.B)
+		if a == b {
+			continue // 自环忽略
 		}
-		if _, ok := s.adj[edge.A]; !ok {
-			s.nodes = append(s.nodes, edge.A)
-		}
-		if _, ok := s.adj[edge.B]; !ok {
-			s.nodes = append(s.nodes, edge.B)
-		}
-		s.adj[edge.A] = append(s.adj[edge.A], edge.B)
-		s.adj[edge.B] = append(s.adj[edge.B], edge.A)
+		adj[a] = append(adj[a], half{to: b, edge: edgeCount})
+		adj[b] = append(adj[b], half{to: a, edge: edgeCount})
+		edgeCount++
 	}
+
+	n := len(names)
+	disc := make([]int, n)
+	low := make([]int, n)
+	parent := make([]int, n)
+	parentEdge := make([]int, n)
+	iter := make([]int, n)
+	articulation := make([]bool, n)
+	bridges := []Edge{}
+	clock := 0
 	components := 0
-	for _, node := range s.nodes {
-		if _, ok := s.disc[node]; ok {
+	stack := []int{}
+
+	for root := 0; root < n; root++ {
+		if disc[root] != 0 {
 			continue
 		}
 		components++
-		s.dfs(node, "")
-	}
-	names := []string{}
-	for name, marked := range s.articulation {
-		if marked {
-			names = append(names, name)
+		clock++
+		disc[root] = clock
+		low[root] = clock
+		parent[root] = -1
+		parentEdge[root] = -1
+		rootChildren := 0
+		stack = append(stack[:0], root)
+		for len(stack) > 0 {
+			v := stack[len(stack)-1]
+			if iter[v] < len(adj[v]) {
+				h := adj[v][iter[v]]
+				iter[v]++
+				if h.edge == parentEdge[v] {
+					continue // 只跳过来时的那条边，平行边算回边
+				}
+				w := h.to
+				if disc[w] != 0 {
+					if disc[w] < low[v] {
+						low[v] = disc[w]
+					}
+					continue
+				}
+				clock++
+				disc[w] = clock
+				low[w] = clock
+				parent[w] = v
+				parentEdge[w] = h.edge
+				if v == root {
+					rootChildren++
+				}
+				stack = append(stack, w)
+				continue
+			}
+			stack = stack[:len(stack)-1]
+			p := parent[v]
+			if p == -1 {
+				continue
+			}
+			if low[v] < low[p] {
+				low[p] = low[v]
+			}
+			if low[v] > disc[p] {
+				a, b := names[p], names[v]
+				if b < a {
+					a, b = b, a
+				}
+				bridges = append(bridges, Edge{A: a, B: b})
+			}
+			if parent[p] != -1 && low[v] >= disc[p] {
+				articulation[p] = true
+			}
+		}
+		if rootChildren > 1 {
+			articulation[root] = true
 		}
 	}
-	return Result{Bridges: s.bridges, Articulation: names, Components: components}
+
+	sort.Slice(bridges, func(i, j int) bool {
+		if bridges[i].A != bridges[j].A {
+			return bridges[i].A < bridges[j].A
+		}
+		return bridges[i].B < bridges[j].B
+	})
+	cuts := []string{}
+	for i, marked := range articulation {
+		if marked {
+			cuts = append(cuts, names[i])
+		}
+	}
+	sort.Strings(cuts)
+	return Result{Bridges: bridges, Articulation: cuts, Components: components}
 }
